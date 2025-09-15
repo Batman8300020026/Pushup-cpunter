@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Push-up Breath Counter</title>
+<style>
+  :root{--bg:#0f1724;--card:#0b1220;--accent:#10b981;--muted:#94a3b8;color-scheme:dark}
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:linear-gradient(180deg,#071020 0%,#071427 100%);color:#e6eef6}
+  .card{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border:1px solid rgba(255,255,255,0.03);padding:20px;border-radius:12px;width:360px;box-shadow:0 8px 30px rgba(2,6,23,0.7)}
+  h1{margin:0 0 6px;font-size:20px}
+  p{margin:0 0 16px;color:var(--muted);font-size:13px}
+  .count{font-size:56px;font-weight:700;text-align:center;margin:10px 0;color:var(--accent)}
+  .controls{display:flex;gap:8px;flex-wrap:wrap}
+  button{flex:1;padding:10px;border-radius:8px;border:0;background:#0ea5a1;color:white;font-weight:600}
+  button.secondary{background:#1e293b}
+  .row{display:flex;gap:10px;align-items:center;margin:8px 0}
+  label{font-size:13px;color:var(--muted)}
+  input[type=range]{width:100%}
+  .small{font-size:12px;color:var(--muted)}
+  .status{font-size:13px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.02);text-align:center}
+  footer{margin-top:12px;font-size:12px;color:var(--muted);text-align:center}
+</style>
+</head>
+<body>
+  <div class="card" role="application" aria-label="Push-up breath counter">
+    <h1>Push-up Breath Counter</h1>
+    <p>App counts one rep each time it detects a short exhale. Calibrate in quiet environment first for best results.</p>
+
+    <div class="count" id="count">0</div>
+
+    <div class="row">
+      <div class="controls" style="width:100%">
+        <button id="startBtn">Start</button>
+        <button id="calBtn" class="secondary">Calibrate</button>
+        <button id="resetBtn" class="secondary">Reset</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <label style="flex:1">Sensitivity <span id="sensVal">1.0</span></label>
+      <input id="sens" type="range" min="0.4" max="2.0" step="0.05" value="1">
+    </div>
+
+    <div class="row">
+      <div style="flex:1">
+        <label class="small">Status</label>
+        <div class="status" id="status">Idle</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label class="small">Live levels (RMS / LowFreq)</label>
+      <div style="flex:1">
+        <div id="levels" class="status">— / —</div>
+      </div>
+    </div>
+
+<footer>
+  Developed by <strong>Ahmad Afsaryan</strong>
+</footer>
+  </div>
+
+<script>
+(async function(){
+  const startBtn = document.getElementById('startBtn');
+  const calBtn = document.getElementById('calBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const statusEl = document.getElementById('status');
+  const countEl = document.getElementById('count');
+  const sens = document.getElementById('sens');
+  const sensVal = document.getElementById('sensVal');
+  const levels = document.getElementById('levels');
+
+  let audioCtx, micStream, analyser, source, rafId;
+  let running = false;
+  let pushCount = 0;
+
+  // Parameters
+  let sensitivityMultiplier = parseFloat(sens.value); // user control
+  let baseRmsThreshold = 0.02;  // baseline threshold after calibration
+  let baseLowFreqRatio = 1.0;   // baseline low freq ratio
+  let dynamicRmsThreshold = baseRmsThreshold;
+  let minIntervalMs = 700; // min ms between counts to debounce
+  let lastCountTime = 0;
+
+  // Analyse setup
+  function createAudioNodes(stream){
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048; // decent time/frequency resolution
+    analyser.smoothingTimeConstant = 0.2;
+    source = audioCtx.createMediaStreamSource(stream);
+    source.connect(analyser);
+  }
+
+  // compute RMS and low-frequency energy ratio
+  function computeLevels(){
+    const timeData = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(timeData);
+    // RMS (time domain)
+    let sum = 0;
+    for (let i=0;i<timeData.length;i++){ sum += timeData[i]*timeData[i]; }
+    const rms = Math.sqrt(sum/timeData.length);
+
+    // Frequency domain low energy
+    const freqData = new Float32Array(analyser.frequencyBinCount);
+    analyser.getFloatFrequencyData(freqData); // dB values
+    // convert dB to linear:
+    let linear = new Float32Array(freqData.length);
+    for (let i=0;i<freqData.length;i++){
+      linear[i] = Math.pow(10, freqData[i]/20);
+    }
+    // sum low freq bins (up to ~900Hz)
+    const nyquist = audioCtx.sampleRate / 2;
+    const cutoffHz = 900;
+    let lowSum = 0, totalSum = 0;
+    for (let i=0;i<linear.length;i++){
+      const freq = i * nyquist / linear.length;
+      totalSum += linear[i];
+      if (freq <= cutoffHz) lowSum += linear[i];
+    }
+    const lowRatio = totalSum > 0 ? (lowSum/totalSum) : 0;
+    return {rms, lowRatio};
+  }
+
+  // Main detector loop
+  function tick(){
+    const now = performance.now();
+    const {rms, lowRatio} = computeLevels();
+    levels.textContent = rms.toFixed(3) + " / " + lowRatio.toFixed(2);
+
+    // dynamic threshold: baseline times sensitivityMultiplier, but allow small adapt
+    dynamicRmsThreshold = baseRmsThreshold * sensitivityMultiplier;
+
+    // If RMS exceeds threshold AND lowRatio is >= baseline * some factor => treat as exhale
+    const lowRatioFactor = 0.8; // exhale tends to raise low freq energy, this is heuristic
+    if (rms > dynamicRmsThreshold && lowRatio >= baseLowFreqRatio * lowRatioFactor) {
+      if (now - lastCountTime > minIntervalMs) {
+        lastCountTime = now;
+        pushCount++;
+        countEl.textContent = pushCount;
+        // tiny visual feedback
+        statusEl.textContent = "Exhale detected ✓";
+        statusEl.style.background = "rgba(16,185,129,0.08)";
+        // brief highlight
+        setTimeout(()=>{ statusEl.textContent = "Listening"; statusEl.style.background=""; }, 350);
+      }
+    }
+
+    rafId = requestAnimationFrame(tick);
+  }
+
+  // Start listening
+  async function start(){
+    if (running) return;
+    try {
+      statusEl.textContent = "Starting…";
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: {echoCancellation:true, noiseSuppression:true, autoGainControl:true}, video:false });
+      createAudioNodes(micStream);
+      // auto-calibrate a bit if user hasn't calibrated
+      if (!calibrated) {
+        statusEl.textContent = "Auto-calibrating (2s)…";
+        await autoCalibrate(2000);
+      }
+      running = true;
+      startBtn.textContent = "Stop";
+      statusEl.textContent = "Listening";
+      rafId = requestAnimationFrame(tick);
+    } catch (err){
+      console.error(err);
+      alert("Microphone access required. Error: " + (err.message || err));
+      statusEl.textContent = "Error: microphone blocked";
+    }
+  }
+
+  // Stop listening
+  function stop(){
+    if (!running) return;
+    if (rafId) cancelAnimationFrame(rafId);
+    if (source) try{ source.disconnect(); } catch(e){}
+    if (analyser) try{ analyser.disconnect(); } catch(e){}
+    if (audioCtx) try{ audioCtx.close(); } catch(e){}
+    if (micStream){
+      const tracks = micStream.getTracks();
+      tracks.forEach(t=>t.stop());
+    }
+    running = false;
+    startBtn.textContent = "Start";
+    statusEl.textContent = "Idle";
+    levels.textContent = "— / —";
+  }
+
+  // Calibration: measure background noise for given duration and set thresholds
+  let calibrated = false;
+  async function autoCalibrate(ms=2000){
+    if (!analyser) return;
+    // take a few samples to compute average RMS and lowRatio
+    const samples = [];
+    const lowRatios = [];
+    const attempts = Math.max(3, Math.round(ms / 200));
+    for (let i=0;i<attempts;i++){
+      await new Promise(r => setTimeout(r, 200));
+      const {rms, lowRatio} = computeLevels();
+      samples.push(rms);
+      lowRatios.push(lowRatio);
+    }
+    const avgRms = samples.reduce((a,b)=>a+b,0)/samples.length;
+    const avgLow = lowRatios.reduce((a,b)=>a+b,0)/lowRatios.length;
+    // choose threshold slightly above ambient
+    baseRmsThreshold = Math.max(0.004, avgRms * 2.2); // avoid too low
+    baseLowFreqRatio = Math.max(0.18, avgLow * 0.9);
+    calibrated = true;
+    statusEl.textContent = "Calibrated";
+    console.log("Calibration result:", {avgRms, baseRmsThreshold, avgLow, baseLowFreqRatio});
+    setTimeout(()=> { if (running) statusEl.textContent = "Listening"; }, 800);
+  }
+
+  // explicit calibration button
+  calBtn.addEventListener('click', async ()=>{
+    if (!audioCtx || !analyser){
+      // start microphone if not started
+      try{
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: {echoCancellation:true, noiseSuppression:true}, video:false });
+        createAudioNodes(micStream);
+      } catch(err){
+        alert("Microphone access needed for calibration: " + err.message);
+        return;
+      }
+    }
+    statusEl.textContent = "Calibrating (3s) — stay quiet…";
+    await autoCalibrate(3000);
+  });
+
+  startBtn.addEventListener('click', ()=>{
+    if (!running) start(); else stop();
+  });
+
+  resetBtn.addEventListener('click', ()=>{
+    pushCount = 0;
+    countEl.textContent = "0";
+  });
+
+  sens.addEventListener('input', ()=>{
+    sensitivityMultiplier = parseFloat(sens.value);
+    sensVal.textContent = sensitivityMultiplier.toFixed(2);
+  });
+
+  // Try to resume audio context on first user gesture (mobile autoplay policy)
+  document.addEventListener('click', async function resumeOnce(){
+    if (audioCtx && audioCtx.state === 'suspended') {
+      try { await audioCtx.resume(); } catch(e){}
+    }
+    document.removeEventListener('click', resumeOnce);
+  });
+
+  // Clean up on page hide
+  window.addEventListener('pagehide', ()=> stop());
+
+  // Helpful tip if page loaded on insecure context
+  if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+    statusEl.textContent = "For best results open this page on HTTPS (or localhost).";
+  }
+
+  // Quick instructions for the user
+  console.log("Push-up breath counter ready. Click Start, allow mic, calibrate in quiet place, then do push-ups — exhale should be detected as counts.");
+})();
+</script>
+</body>
+</html>
